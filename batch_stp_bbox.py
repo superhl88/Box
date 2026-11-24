@@ -6,6 +6,8 @@ import multiprocessing
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+BATCH_SIZE = 10000  # 每个 Excel 表格记录的料号上限
+
 
 def check_and_import():
     missing = []
@@ -48,7 +50,6 @@ def extract_bbox_xyz(shape):
     if bbox.IsVoid():
         return None
 
-    # 优先使用 CornerMin / CornerMax，避免部分 pybind11 版本下 Get() 返回值转换失败
     try:
         p_min = bbox.CornerMin()
         p_max = bbox.CornerMax()
@@ -90,20 +91,17 @@ def calc_step_dimensions(filepath):
         if shape.IsNull():
             return (part_no, filename, 0.0, 0.0, 0.0, 0.0, 0, "空模型", abs_path, "OneShape is Null")
 
-        # 1. 统计实体(SOLID)数量
         solid_count = 0
         explorer = TopExp_Explorer(shape, TopAbs_SOLID)
         while explorer.More():
             solid_count += 1
             explorer.Next()
 
-        # 2. 计算长宽高
         xyz = extract_bbox_xyz(shape)
         if xyz is None:
             return (part_no, filename, 0.0, 0.0, 0.0, 0.0, solid_count, "无有效边界", abs_path, "Bnd_Box is Void")
         length_x, width_y, height_z = xyz
 
-        # 3. 单独计算体积（失败不影响长宽高输出）
         vol_mm3 = 0.0
         vol_note = ""
         try:
@@ -136,6 +134,65 @@ def calc_step_dimensions(filepath):
         return (part_no, filename, 0.0, 0.0, 0.0, 0.0, 0, f"异常: {short_err[:120]}", abs_path, tb_text)
 
 
+def make_crash_record(filepath, reason="子进程异常终止/底层崩溃"):
+    abs_path = os.path.abspath(filepath)
+    filename = os.path.basename(abs_path)
+    part_no = os.path.splitext(filename)[0]
+    return (part_no, filename, 0.0, 0.0, 0.0, 0.0, 0, f"异常: {reason}", abs_path, reason)
+
+
+def run_single_safe(filepath):
+    """在独立单进程池中运行单个文件，防止该文件把整批任务拖垮"""
+    try:
+        with ProcessPoolExecutor(max_workers=1) as single_exec:
+            fut = single_exec.submit(calc_step_dimensions, filepath)
+            return fut.result(timeout=60)
+    except Exception as e:
+        return make_crash_record(filepath, f"单文件兜底异常: {str(e)[:100]}")
+
+
+def process_files_resilient(stp_files, max_workers):
+    """分块并行处理；若某块触发 BrokenProcessPool，则逐个安全处理"""
+    total = len(stp_files)
+    results = [None] * total
+    completed = 0
+    chunk_size = 50
+
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        chunk_indices = list(range(start, end))
+        chunk_done = False
+
+        try:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(calc_step_dimensions, stp_files[i]): i
+                    for i in chunk_indices
+                }
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        results[idx] = future.result()
+                    except Exception as fe:
+                        results[idx] = make_crash_record(stp_files[idx], f"Future异常: {str(fe)[:100]}")
+                    completed += 1
+                    if completed % 50 == 0 or completed == total:
+                        print(f"进度: {completed} / {total} ({completed * 100.0 / total:.1f}%)")
+            chunk_done = True
+        except Exception as pool_err:
+            print(f"\n[提示] 批次 ({start + 1}-{end}) 检测到进程池异常 ({type(pool_err).__name__})，正在切换逐个安全模式...")
+
+        if not chunk_done:
+            for idx in chunk_indices:
+                if results[idx] is None:
+                    results[idx] = run_single_safe(stp_files[idx])
+                    completed += 1
+                    if completed % 20 == 0 or completed == total:
+                        print(f"进度(安全模式): {completed} / {total} ({completed * 100.0 / total:.1f}%)")
+
+    return results
+
+
 def scan_stp_files(root_dir):
     """递归遍历当前文件夹及其所有子文件夹下的 .stp / .step 文件"""
     stp_files = []
@@ -161,7 +218,7 @@ def scan_stp_files(root_dir):
 
 
 def save_to_excel(records, output_path):
-    """将最多 10000 条记录写入格式化良好的 Excel 文件"""
+    """将最多 BATCH_SIZE (10000) 条记录写入格式化良好的 Excel 文件"""
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
@@ -231,6 +288,25 @@ def save_to_excel(records, output_path):
     wb.save(output_path)
 
 
+def export_excel_batches(results, output_folder, batch_size=BATCH_SIZE):
+    """按每 batch_size (10000) 个料号切分并导出独立的 Excel 文件"""
+    total_files = len(results)
+    num_batches = (total_files + batch_size - 1) // batch_size
+    generated_files = []
+
+    for b in range(num_batches):
+        start_idx = b * batch_size
+        end_idx = min((b + 1) * batch_size, total_files)
+        batch_records = results[start_idx:end_idx]
+        excel_name = f"STP长宽高明细_第{b + 1:02d}卷_({start_idx + 1}-{end_idx}).xlsx"
+        excel_path = os.path.join(output_folder, excel_name)
+        print(f"正在生成 [{b + 1}/{num_batches}]: {excel_name} (共 {len(batch_records)} 个料号)...")
+        save_to_excel(batch_records, excel_path)
+        generated_files.append(excel_path)
+
+    return generated_files
+
+
 def main():
     check_and_import()
 
@@ -244,6 +320,7 @@ def main():
     print("=" * 60)
     print(f"当前运行目录: {current_dir}")
     print(f"扫描范围: 该目录及所有子文件夹")
+    print(f"分卷规则: 每 {BATCH_SIZE} 个料号生成 1 个 Excel 文件")
     print("=" * 60)
     print("正在检索 .stp / .step 文件，请稍候...")
 
@@ -255,50 +332,30 @@ def main():
         print("当前目录及子文件夹中未找到任何 .stp 或 .step 文件。")
         return
 
-    max_workers = max(1, (os.cpu_count() or 4) - 1)
+    cpu_cnt = os.cpu_count() or 2
+    max_workers = max(1, min(4, cpu_cnt - 1)) if getattr(sys, "frozen", False) else max(1, min(6, cpu_cnt - 1))
     print(f"启动 {max_workers} 个并行工作进程开始计算长宽高...")
 
-    results = [None] * total_files
-    completed = 0
-
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        future_to_idx = {executor.submit(calc_step_dimensions, fp): i for i, fp in enumerate(stp_files)}
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            results[idx] = future.result()
-            completed += 1
-            if completed % 100 == 0 or completed == total_files:
-                print(f"进度: {completed} / {total_files} ({completed * 100.0 / total_files:.1f}%)")
-
+    results = process_files_resilient(stp_files, max_workers)
     results.sort(key=lambda x: x[0])
 
-    batch_size = 10000
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_folder = os.path.join(current_dir, f"STP长宽高统计结果_{timestamp}")
     os.makedirs(output_folder, exist_ok=True)
 
-    # 若有异常，单独保存完整错误日志方便排查
     err_items = [r for r in results if r[9]]
     if err_items:
         err_log_path = os.path.join(output_folder, "错误详情日志.txt")
         with open(err_log_path, "w", encoding="utf-8") as lf:
-            for item in err_items[:20]:
+            for item in err_items[:50]:
                 lf.write(f"文件: {item[8]}\n状态: {item[7]}\n{item[9]}\n" + ("-" * 50) + "\n")
         print(f"检测到 {len(err_items)} 条异常记录，首条异常摘要: {err_items[0][7]}")
-        print(f"完整异常堆栈已写入: {err_log_path}")
+        print(f"异常明细已写入: {err_log_path}")
 
-    num_batches = (total_files + batch_size - 1) // batch_size
-    for b in range(num_batches):
-        start_idx = b * batch_size
-        end_idx = min((b + 1) * batch_size, total_files)
-        batch_records = results[start_idx:end_idx]
-        excel_name = f"STP长宽高明细_第{b + 1:02d}卷_({start_idx + 1}-{end_idx}).xlsx"
-        excel_path = os.path.join(output_folder, excel_name)
-        print(f"正在生成: {excel_name} ...")
-        save_to_excel(batch_records, excel_path)
+    generated_files = export_excel_batches(results, output_folder, batch_size=BATCH_SIZE)
 
     print("=" * 60)
-    print(f"全部处理完成！共生成 {num_batches} 个 Excel 文件。")
+    print(f"全部处理完成！共生成 {len(generated_files)} 个 Excel 文件（每表最多 {BATCH_SIZE} 个料号）。")
     print(f"输出目录: {output_folder}")
     print("=" * 60)
 
@@ -309,4 +366,5 @@ if __name__ == "__main__":
         main()
     except Exception:
         traceback.print_exc()
-    input("\n按回车键退出程序...")
+    if sys.stdin and sys.stdin.isatty():
+        input("\n按回车键退出程序...")
