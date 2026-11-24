@@ -24,58 +24,99 @@ def check_and_import():
         subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
 
 
+def extract_bbox_xyz(shape):
+    """提取轴对齐包围盒的长(X)、宽(Y)、高(Z)，兼容 CornerMin/CornerMax 与 Get()"""
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SHELL, TopAbs_FACE
+
+    bbox = Bnd_Box()
+    BRepBndLib.Add_s(shape, bbox, False)
+    if bbox.IsVoid():
+        BRepBndLib.Add_s(shape, bbox, True)
+
+    if bbox.IsVoid():
+        for sub_type in (TopAbs_SHELL, TopAbs_FACE):
+            exp = TopExp_Explorer(shape, sub_type)
+            while exp.More():
+                BRepBndLib.Add_s(exp.Current(), bbox, True)
+                exp.Next()
+            if not bbox.IsVoid():
+                break
+
+    if bbox.IsVoid():
+        return None
+
+    # 优先使用 CornerMin / CornerMax，避免部分 pybind11 版本下 Get() 返回值转换失败
+    try:
+        p_min = bbox.CornerMin()
+        p_max = bbox.CornerMax()
+        lx = max(0.0, float(p_max.X()) - float(p_min.X()))
+        ly = max(0.0, float(p_max.Y()) - float(p_min.Y()))
+        lz = max(0.0, float(p_max.Z()) - float(p_min.Z()))
+        return lx, ly, lz
+    except Exception:
+        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+        return (
+            max(0.0, float(xmax) - float(xmin)),
+            max(0.0, float(ymax) - float(ymin)),
+            max(0.0, float(zmax) - float(zmin)),
+        )
+
+
 def calc_step_dimensions(filepath):
     """
-    使用 OpenCascade (OCP) 读取 STEP 文件并获取轴对齐包围盒（长 X、宽 Y、高 Z）及体积。
-    返回: (料号, 完整文件名, 长_mm, 宽_mm, 高_mm, 体积_mm3, 实体数, 状态, 完整路径)
+    读取 STEP 文件并获取长(X)、宽(Y)、高(Z)、体积及实体数量。
+    返回: (料号, 完整文件名, 长_mm, 宽_mm, 高_mm, 体积_mm3, 实体数, 状态, 完整路径, 详细错误)
     """
-    filename = os.path.basename(filepath)
+    abs_path = os.path.abspath(filepath)
+    filename = os.path.basename(abs_path)
     part_no = os.path.splitext(filename)[0]
+
     try:
         from OCP.STEPControl import STEPControl_Reader
         from OCP.IFSelect import IFSelect_RetDone
-        from OCP.Bnd import Bnd_Box
-        from OCP.BRepBndLib import BRepBndLib
-        from OCP.GProp import GProp_GProps
-        from OCP.BRepGProp import BRepGProp
         from OCP.TopExp import TopExp_Explorer
         from OCP.TopAbs import TopAbs_SOLID
 
         reader = STEPControl_Reader()
-        status = reader.ReadFile(filepath)
+        status = reader.ReadFile(abs_path)
         if status != IFSelect_RetDone:
-            return (part_no, filename, 0.0, 0.0, 0.0, 0.0, 0, "读取失败(STEP格式异常)", filepath)
+            return (part_no, filename, 0.0, 0.0, 0.0, 0.0, 0, "读取失败", abs_path, f"ReadFile status={status}")
 
         reader.TransferRoots()
         shape = reader.OneShape()
         if shape.IsNull():
-            return (part_no, filename, 0.0, 0.0, 0.0, 0.0, 0, "空模型(无几何体)", filepath)
+            return (part_no, filename, 0.0, 0.0, 0.0, 0.0, 0, "空模型", abs_path, "OneShape is Null")
 
-        # 统计实体(SOLID)数量
-        explorer = TopExp_Explorer(shape, TopAbs_SOLID)
+        # 1. 统计实体(SOLID)数量
         solid_count = 0
+        explorer = TopExp_Explorer(shape, TopAbs_SOLID)
         while explorer.More():
             solid_count += 1
             explorer.Next()
 
-        # 计算精确轴对齐包围盒 (X=长, Y=宽, Z=高)
-        bbox = Bnd_Box()
-        # useTriangulation=False 使用精确几何边界求包围盒
-        BRepBndLib.Add_s(shape, bbox, False)
+        # 2. 计算长宽高
+        xyz = extract_bbox_xyz(shape)
+        if xyz is None:
+            return (part_no, filename, 0.0, 0.0, 0.0, 0.0, solid_count, "无有效边界", abs_path, "Bnd_Box is Void")
+        length_x, width_y, height_z = xyz
 
-        if bbox.IsVoid():
-            return (part_no, filename, 0.0, 0.0, 0.0, 0.0, solid_count, "警告: 包围盒为空", filepath)
+        # 3. 单独计算体积（失败不影响长宽高输出）
+        vol_mm3 = 0.0
+        vol_note = ""
+        try:
+            from OCP.GProp import GProp_GProps
+            from OCP.BRepGProp import BRepGProp
 
-        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
-        length_x = max(0.0, xmax - xmin)
-        width_y = max(0.0, ymax - ymin)
-        height_z = max(0.0, zmax - zmin)
+            props = GProp_GProps()
+            BRepGProp.VolumeProperties_s(shape, props)
+            vol_mm3 = abs(float(props.Mass()))
+        except Exception as ve:
+            vol_note = f" (体积计算失败: {str(ve).splitlines()[0]})"
 
-        # 计算体积 (mm³)
-        props = GProp_GProps()
-        BRepGProp.VolumeProperties_s(shape, props)
-        vol_mm3 = abs(props.Mass())
-
+        status_msg = ("成功" if solid_count > 0 else "成功(仅曲面/壳体)") + vol_note
         return (
             part_no,
             filename,
@@ -84,12 +125,15 @@ def calc_step_dimensions(filepath):
             round(height_z, 4),
             round(vol_mm3, 4),
             solid_count,
-            "成功",
-            filepath,
+            status_msg,
+            abs_path,
+            "",
         )
 
     except Exception as e:
-        return (part_no, filename, 0.0, 0.0, 0.0, 0.0, 0, f"异常: {str(e)[:80]}", filepath)
+        tb_text = traceback.format_exc()
+        short_err = str(e).splitlines()[0] if str(e) else repr(e)
+        return (part_no, filename, 0.0, 0.0, 0.0, 0.0, 0, f"异常: {short_err[:120]}", abs_path, tb_text)
 
 
 def scan_stp_files(root_dir):
@@ -160,11 +204,10 @@ def save_to_excel(records, output_path):
     warn_font = Font(name="微软雅黑", size=10, color="C00000")
 
     for idx, rec in enumerate(records, start=1):
-        # rec: (part_no, filename, length_x, width_y, height_z, vol_mm3, solid_count, status, filepath)
         row_data = [idx, rec[0], rec[1], rec[2], rec[3], rec[4], rec[5], rec[6], rec[7], rec[8]]
         ws.append(row_data)
         row_num = idx + 1
-        is_ok = rec[7] == "成功"
+        is_ok = str(rec[7]).startswith("成功")
 
         for col_idx in range(1, len(headers) + 1):
             c = ws.cell(row=row_num, column=col_idx)
@@ -178,7 +221,7 @@ def save_to_excel(records, output_path):
             else:
                 c.alignment = Alignment(horizontal="left", vertical="center")
 
-    col_widths = [8, 28, 32, 15, 15, 15, 18, 12, 22, 65]
+    col_widths = [8, 28, 32, 15, 15, 15, 18, 12, 26, 65]
     for i, w in enumerate(col_widths, start=1):
         col_letter = openpyxl.utils.get_column_letter(i)
         ws.column_dimensions[col_letter].width = w
@@ -196,7 +239,6 @@ def main():
     else:
         current_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # 搜索当前文件夹及其所有子文件夹；如果直接放在盘符根目录（如 D:\），则自动扫描整个磁盘
     scan_root = current_dir
 
     print("=" * 60)
@@ -234,6 +276,16 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_folder = os.path.join(current_dir, f"STP长宽高统计结果_{timestamp}")
     os.makedirs(output_folder, exist_ok=True)
+
+    # 若有异常，单独保存完整错误日志方便排查
+    err_items = [r for r in results if r[9]]
+    if err_items:
+        err_log_path = os.path.join(output_folder, "错误详情日志.txt")
+        with open(err_log_path, "w", encoding="utf-8") as lf:
+            for item in err_items[:20]:
+                lf.write(f"文件: {item[8]}\n状态: {item[7]}\n{item[9]}\n" + ("-" * 50) + "\n")
+        print(f"检测到 {len(err_items)} 条异常记录，首条异常摘要: {err_items[0][7]}")
+        print(f"完整异常堆栈已写入: {err_log_path}")
 
     num_batches = (total_files + batch_size - 1) // batch_size
     for b in range(num_batches):
